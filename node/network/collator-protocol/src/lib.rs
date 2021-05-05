@@ -26,10 +26,10 @@ use futures::{FutureExt, TryFutureExt};
 
 use sp_keystore::SyncCryptoStorePtr;
 
-use polkadot_node_network_protocol::{PeerId, UnifiedReputationChange as Rep};
-use polkadot_primitives::v1::CollatorPair;
+use polkadot_node_network_protocol::PeerId;
+use polkadot_primitives::v1::{CollatorId, CollatorPair};
 use polkadot_subsystem::{
-	messages::{AllMessages, CollatorProtocolMessage, NetworkBridgeMessage},
+	messages::CollatorProtocolMessage,
 	SpawnedSubsystem, Subsystem, SubsystemContext, SubsystemError,
 };
 
@@ -38,6 +38,7 @@ use error::Result;
 
 mod collator_side;
 mod validator_side;
+mod peer_slots;
 
 const LOG_TARGET: &'static str = "parachain::collator-protocol";
 
@@ -129,20 +130,3 @@ where
 	}
 }
 
-/// Modify the reputation of a peer based on its behavior.
-#[tracing::instrument(level = "trace", skip(ctx), fields(subsystem = LOG_TARGET))]
-async fn modify_reputation<Context>(ctx: &mut Context, peer: PeerId, rep: Rep)
-where
-	Context: SubsystemContext,
-{
-	tracing::trace!(
-		target: LOG_TARGET,
-		rep = ?rep,
-		peer_id = %peer,
-		"reputation change for peer",
-	);
-
-	ctx.send_message(AllMessages::NetworkBridge(
-		NetworkBridgeMessage::ReportPeer(peer, rep),
-	)).await;
-}
