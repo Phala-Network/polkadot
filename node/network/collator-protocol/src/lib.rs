@@ -27,7 +27,7 @@ use futures::{FutureExt, TryFutureExt};
 use sp_keystore::SyncCryptoStorePtr;
 
 use polkadot_node_network_protocol::PeerId;
-use polkadot_primitives::v1::{CollatorId, CollatorPair};
+use polkadot_primitives::v1::CollatorPair;
 use polkadot_subsystem::{
 	messages::CollatorProtocolMessage,
 	SpawnedSubsystem, Subsystem, SubsystemContext, SubsystemError,
@@ -38,7 +38,6 @@ use error::Result;
 
 mod collator_side;
 mod validator_side;
-mod peer_slots;
 
 const LOG_TARGET: &'static str = "parachain::collator-protocol";
 

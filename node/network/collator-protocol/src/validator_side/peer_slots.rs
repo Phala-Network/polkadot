@@ -1,11 +1,26 @@
+// Copyright 2021 Parity Technologies (UK) Ltd.
+// This file is part of Polkadot.
+
+// Polkadot is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// Polkadot is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
+
 use super::{CollatorId, CollatorProtocolMessage, PeerId, SubsystemContext, LOG_TARGET};
 use std::time::Instant;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Index, IndexMut};
 
-use rand::{thread_rng, Rng, rngs::ThreadRng};
-use rand::prelude::SliceRandom;
+use rand::{thread_rng, Rng};
 
 use sp_keystore::SyncCryptoStorePtr;
 
@@ -13,25 +28,30 @@ use polkadot_node_network_protocol::{UnifiedReputationChange as Rep, View};
 use polkadot_primitives::v1::{Hash, Id as ParaId};
 use polkadot_subsystem::{messages::{AllMessages, NetworkBridgeMessage}, SubsystemSender};
 
-pub(crate) const CACHE_SIZE: usize = 10_000;
-pub(crate) const RESERVOIR_SIZE: usize = 1_000;
+// CACHE_SIZE determines the size (in number of entries) of in-memory cache maintained for the
+// purposes of determining a collator's fitness. Metrics for collators that do not fit in the
+// Cache are stored in a database.
+const CACHE_SIZE: usize = 10_000;
+// RESERVOIR SIZE determines the upper bound on the number of collator connections
+const RESERVOIR_SIZE: usize = 1_000;
 
-pub(crate) const COST_UNEXPECTED_MESSAGE: Rep = Rep::CostMinor("An unexpected message");
+/// Message was went out-of-order
+const COST_UNEXPECTED_MESSAGE: Rep = Rep::CostMinor("An unexpected message");
 /// Message could not be decoded properly.
-pub(crate) const COST_CORRUPTED_MESSAGE: Rep = Rep::CostMinor("Message was corrupt");
+const COST_CORRUPTED_MESSAGE: Rep = Rep::CostMinor("Message was corrupt");
 /// Network errors that originated at the remote host should have same cost as timeout.
-pub(crate) const COST_NETWORK_ERROR: Rep = Rep::CostMinor("Some network error");
-pub(crate) const COST_REQUEST_TIMED_OUT: Rep =
+const COST_NETWORK_ERROR: Rep = Rep::CostMinor("Some network error");
+const COST_REQUEST_TIMED_OUT: Rep =
 	Rep::CostMinor("A collation request has timed out");
-pub(crate) const COST_INVALID_SIGNATURE: Rep =
+pub(super) const COST_INVALID_SIGNATURE: Rep =
 	Rep::Malicious("Invalid network message signature");
-pub(crate) const COST_WRONG_PARA: Rep =
+const COST_WRONG_PARA: Rep =
 	Rep::Malicious("A collator provided a collation for the wrong para");
-pub(crate) const COST_UNNEEDED_COLLATOR: Rep = Rep::CostMinor("An unneeded collator connected");
+pub(super) const COST_UNNEEDED_COLLATOR: Rep = Rep::CostMinor("An unneeded collator connected");
 
-pub(crate) const COST_REPORT_BAD: Rep =
+pub(super) const COST_REPORT_BAD: Rep =
 	Rep::Malicious("A collator was reported by another subsystem");
-pub(crate) const BENEFIT_NOTIFY_GOOD: Rep =
+pub(super) const BENEFIT_NOTIFY_GOOD: Rep =
 	Rep::BenefitMinor("A collator was noted good by another subsystem");
 
 const COLLATOR_METRICS: [Rep; 9] = [
@@ -63,13 +83,13 @@ pub enum FitnessEvent {
 #[derive(Copy, Clone)]
 pub struct FitnessMetric {
 	last: std::time::Instant,
-	avg: f64,
+	cumulative: std::time::Duration,
 	total: u64,
 }
 
 impl PartialEq for FitnessMetric {
 	fn eq(&self, other: &Self) -> bool {
-		(self.avg - other.avg).abs() < f64::EPSILON
+		(self.fitness() - other.fitness()).abs() < f64::EPSILON
 	}
 }
 
@@ -83,7 +103,7 @@ impl PartialOrd for FitnessMetric {
 
 impl Ord for FitnessMetric {
 	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-		if self.avg < other.avg {
+		if self.fitness() < other.fitness() {
 			std::cmp::Ordering::Less
 		} else {
 			std::cmp::Ordering::Greater
@@ -95,30 +115,32 @@ impl FitnessMetric {
 	pub fn new() -> Self {
 		Self {
 			last: std::time::Instant::now(),
-			avg: 0f64,
+			cumulative: std::time::Duration::new(0, 0),
 			total: 0u64,
 		}
 	}
 
 	pub fn insert_event(&mut self) {
-		let mut cumulative = if self.avg == 0f64 {
-			0f64
-		} else {
-			self.total as f64 / self.avg
-		};
 		self.total += 1;
-		cumulative += self.last.elapsed().as_secs() as f64;
-		self.avg = self.total as f64 / cumulative;
+		self.cumulative += self.last.elapsed();
 		self.last = std::time::Instant::now();
+	}
+
+	pub fn fitness(&self) -> f64 {
+		if self.total != 0 {
+			self.cumulative.as_secs() as f64 / self.total as f64
+		} else {
+			0f64
+		}
 	}
 }
 
 pub struct CollatorFitnessMetric([FitnessMetric; 9]);
 
 impl Index<FitnessEvent> for CollatorFitnessMetric {
-    type Output = FitnessMetric;
+	type Output = FitnessMetric;
 	fn index(&self, index: FitnessEvent) -> &FitnessMetric {
-        &self.0[index as usize]
+		&self.0[index as usize]
 	}
 }
 
@@ -137,7 +159,9 @@ impl CollatorFitnessMetric {
 	// Note that this is a naive sum of all metric averages.
 	// In the future we will expand on this functionality.
 	pub fn compute_fitness(&self) -> f64 {
-		self.0.iter().map(|a| a.avg).sum::<f64>()
+		self.0.iter()
+			.map(|a| a.fitness())
+			.sum::<f64>()
 	}
 }
 
@@ -154,6 +178,7 @@ pub enum AdvertisementError {
 	UndeclaredCollator,
 }
 
+#[derive(Debug)]
 struct CollatingPeerState {
 	collator_id: CollatorId,
 	para_id: ParaId,
@@ -162,6 +187,7 @@ struct CollatingPeerState {
 	last_active: Instant,
 }
 
+#[derive(Debug)]
 enum PeerState {
 	// The peer has connected at the given instant.
 	Connected(Instant),
@@ -169,16 +195,19 @@ enum PeerState {
 	Collating(CollatingPeerState),
 }
 
+#[derive(Debug)]
 pub(crate) struct PeerData {
 	view: View,
 	state: PeerState,
+	slot_idx: usize,
 }
 
 impl PeerData {
-	pub fn new(view: View) -> Self {
+	pub fn new(view: View, slot_idx: usize) -> Self {
 		PeerData {
 			view,
 			state: PeerState::Connected(Instant::now()),
+			slot_idx,
 		}
 	}
 
@@ -273,12 +302,6 @@ impl PeerData {
 			PeerState::Connected(connected_at) => connected_at + policy.undeclared < now,
 			PeerState::Collating(ref state) => state.last_active + policy.inactive_collator < now,
 		}
-	}
-}
-
-impl Default for PeerData {
-	fn default() -> Self {
-		PeerData::new(Default::default())
 	}
 }
 
@@ -433,7 +456,7 @@ pub struct PeerSlots {
 	pub(crate) fitness: CollatorFitness,
 	pub(crate) peer_data: Reservoir,
 	pub(crate) active_paras: ActiveParas,
-	stale_peers: Vec<PeerId>,
+	peers: Vec<PeerId>,
 }
 
 impl Default for PeerSlots {
@@ -443,26 +466,56 @@ impl Default for PeerSlots {
 			fitness: lru::LruCache::new(CACHE_SIZE),
 			peer_data: HashMap::new(),
 			active_paras: ActiveParas::default(),
-			stale_peers: Vec::new(),
+			peers: Vec::new(),
 		}
 	}
 }
 
 impl std::fmt::Debug for PeerSlots {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-		write!(f, "Eladed")
+		write!(f, "{:?}", self.peer_data)
 	}
 }
 
 impl PeerSlots {
-	pub fn insert_collator(&mut self, collator_id: &CollatorId) {
+	pub fn insert_collator(&mut self, peer_id: &PeerId, collator_id: &CollatorId) {
 		if self.fitness.get(collator_id).is_none() {
 			self.fitness.put(collator_id.clone(), CollatorFitnessMetric::default());
 		}
-	}
+		
+		let mut peer_fitness = 0f64;
+		let mut slot_idx = 0;
 
-	pub fn stale_peers(&mut self) -> Vec<PeerId> {
-		self.stale_peers.drain(0..).collect()
+		if let Some(peer_data) = self.peer_data.get(peer_id) {
+			slot_idx = peer_data.slot_idx;
+			if let Some(fitness) = self.fitness.get(collator_id) {
+				peer_fitness = fitness.compute_fitness();
+			}
+		}
+	   
+		let mut temp_slot_idx = 0;
+		for i in 0..slot_idx {
+			if let Some(temp_peer_id) = self.peers.get(i) {
+				if let Some(temp_peer_data) = self.peer_data.get_mut(temp_peer_id) {
+					if let Some(temp_collator_id) = temp_peer_data.collator_id() {
+						if let Some(temp_peer_fitness_metric) = self.fitness.get(temp_collator_id) {
+							let temp_peer_fitness = temp_peer_fitness_metric.compute_fitness();
+							if peer_fitness < temp_peer_fitness {
+								temp_peer_data.slot_idx = slot_idx;
+								temp_slot_idx = i;
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		self.peers.swap(slot_idx, temp_slot_idx);
+
+		if let Some(peer_data) = self.peer_data.get_mut(peer_id) {
+			peer_data.slot_idx = temp_slot_idx;
+		}
 	}
 
 	pub fn reset_sample(&mut self) {
@@ -470,16 +523,18 @@ impl PeerSlots {
 	}
 }
 
-pub(crate) fn handle_view_change(peer_slots: &mut PeerSlots, view: &View) {
+pub(crate) fn handle_view_change(peer_slots: &mut PeerSlots, view: &View) -> Vec<PeerId> {
+	let mut out = Vec::new();
 	for (peer_id, peer_data) in peer_slots.peer_data.iter_mut() {
 		peer_data.prune_old_advertisements(view);
 
 		if let Some(para_id) = peer_data.collating_para() {
 			if !peer_slots.active_paras.is_current_or_next(para_id) {
-				 peer_slots.stale_peers.push(*peer_id);
+				out.push(*peer_id);
 			}
 		}
 	}
+	out
 }
 
 pub(crate) async fn cycle_para(
@@ -491,40 +546,6 @@ pub(crate) async fn cycle_para(
 ) {
 	active_paras.assign_incoming(sender, keystore, new_relay_parents).await;
 	active_paras.remove_outgoing(old_relay_parents);
-}
-
-fn peers_to_evict(peer_data: &Reservoir, fitness: &mut CollatorFitness, num: usize, rng: &mut ThreadRng) -> Vec<PeerId> {
-	let mut fitted_reservoir = Vec::new();
-	// Traverse list of peers
-	for (peer_id, peer_data) in peer_data.iter() {
-		// Get collator id
-		if let Some(collator_id) = peer_data.collator_id() {
-			// Get fitness metric
-			if let Some(metric) = fitness.get(collator_id) {
-				fitted_reservoir.push((*peer_id, metric.compute_fitness()));
-			} else {
-				// If the peer is not known to our validator node, we should only evict them if
-				// our reservoir is oversubscribed, so we assign them a fitness of 0 (less is
-				// better)
-				fitted_reservoir.push((*peer_id, 0f64));
-			}
-		}
-	}
-	// Shuffle and then sort our fitted reservoir by reverse fitness.
-	// Note that we should ensure that this sorting includes randomization for all-things-equal
-	// peers. We can explore a better solution when optimizing the PeerSlots data structure.
-	fitted_reservoir.shuffle(rng);
-	fitted_reservoir.sort_by(|a, b| {
-		if a.1 < b.1 {
-			std::cmp::Ordering::Greater
-		} else {
-			std::cmp::Ordering::Less
-		}
-	});
-	// Take the peers we must evict
-	fitted_reservoir.iter().map(|a| a.0)
-		.take(num)
-		.collect()
 }
 
 // Reservoir sampling is a randomized algorithm that allows to maintain a reservoir of fixed size k
@@ -547,7 +568,6 @@ fn peers_to_evict(peer_data: &Reservoir, fitness: &mut CollatorFitness, num: usi
 pub async fn sample_connection(
 	peer_slots: &mut PeerSlots,
 	peer_id: &PeerId,
-	collator_id: &CollatorId,
 ) -> Vec<PeerId> {
 	// Since we cannot intercept incoming connections yet, we must remove the connected peer from
 	// peer_data in order to ensure we do not accidentally schedule them for eviction unless they
@@ -555,50 +575,72 @@ pub async fn sample_connection(
 	//
 	// To that effect, we will remove the peer from peer_data and insert them back after we've
 	// sampled our eviction candidates
-	if let Some(peer_data) = peer_slots.peer_data.remove(peer_id) {
+	if let Some(peer_data) = peer_slots.peer_data.get(peer_id) {
+		// All peers except the Declaring one
+		let total_peers = peer_slots.peer_data.len();
+
+		// Determine how many peer we need to evict
+		let surplus_peers = total_peers.saturating_sub(RESERVOIR_SIZE);
+
+		// Take the worst performing peer and store them at height of the declaring peer
+		peer_slots.peers.swap(total_peers - 1, peer_data.slot_idx);
+		let _ = peer_slots.peers.pop();
+
 		// Increment seq_nr in order to ensure that the sample probability for peer_id to be
 		// included in this reservoir is k/seq_nr.
 		peer_slots.seq_nr += 1;
-		// Insert collator into our fitness metrics if it does not exist yet.
-		peer_slots.insert_collator(collator_id);
-		// Determine how many peer we need to evict
-		let mut surplus_peers = peer_slots.peer_data.len().saturating_sub(RESERVOIR_SIZE - 1);
 
-		// Evict all stale peers, regardless of metrics or sample
-		let mut out: Vec<PeerId> = peer_slots.stale_peers.drain(0..surplus_peers).collect();
+		// Evict the worst peers
+		let mut out: Vec<PeerId> = peer_slots.peers.drain(total_peers - surplus_peers - 1 ..).collect();
 
 		let mut rng = thread_rng();
 
-		// If we must evict additional peers, then we will need to determine the most suitable
-		// peers to evict, i.e. the ones with the worst metrics.
-		//
-		// The below function is O(n*log(n)) as we naively sort the list of peers, but this can be
-		// optimized by modifying the PeerSlots struct to leverage a linked list
-		surplus_peers = surplus_peers.saturating_sub(out.len());
-		if surplus_peers > RESERVOIR_SIZE - 1 {
-			out.extend_from_slice(peers_to_evict(&peer_slots.peer_data, &mut peer_slots.fitness, surplus_peers, &mut rng).as_slice());
-		} else {
-			// If the reservoir is not full, we only evict stale peers
-			peer_slots.peer_data.insert(*peer_id, peer_data);
-			return out;
-		}
-
-		// If there is at least one element in the output, then we know we must sample
-		// the Declaring Collator into our reservoir
-		out.shuffle(&mut rng);
+		// If there is at least one element in the output, i.e. we must evict at least one peer,
+		// then we must sample the Declaring peer into our reservoir with probability
+		// RESERVOIR_SIZE/peer_slots.seq_nr.
 		if let Some(available_slot) = out.pop() {
-			if (rng.gen_range(0..peer_slots.seq_nr) as usize) < CACHE_SIZE {
+			let sample_idx = rng.gen_range(0..peer_slots.seq_nr);
+			// This ensures that after we reset the seq_nr, we will always collate at least
+			// RESERVOIR_SIZE new collators for the current and next parachain
+			if (sample_idx as usize) < RESERVOIR_SIZE {
+				// The worst behaving peer sits at slot_idx.
+				// If slot_idx less than delta, then we must swap with available_slot.
+				// Otherwise, the worst behaving peer will get evicted
+				if peer_data.slot_idx < total_peers - surplus_peers {
+					// Push worst performing peer into output
+					out.push(peer_slots.peers[peer_data.slot_idx]);
+					// Reinstate declaring peer in peer list
+					peer_slots.peers[peer_data.slot_idx] = *peer_id;
+				} else {
+					// Declaring peer is now the worst performing peer
+					peer_slots.peers.push(*peer_id);
+				}
+				// Evict available_slot
 				out.push(available_slot);
 			} else {
+				// Reinstate available_slot in our peer list
+				peer_slots.peers.push(available_slot);
+				// Evict Declaring peer
 				out.push(*peer_id);
 			}
+		} else {
+			// If the reservoir is not full yet, then we should revert the state of the peers list
+			peer_slots.peers.push(*peer_id);
+			peer_slots.peers.swap(peer_data.slot_idx, total_peers - 1);
 		}
-		peer_slots.peer_data.insert(*peer_id, peer_data);
 
 		return out;
 	}
 
 	vec![]
+}
+
+pub fn handle_connection(
+	peer_slots: &mut PeerSlots,
+	peer_id: PeerId,
+) {
+	peer_slots.peer_data.insert(peer_id, PeerData::new(Default::default(), peer_slots.peers.len()));
+	peer_slots.peers.push(peer_id);
 }
 
 pub async fn insert_event<Context>(

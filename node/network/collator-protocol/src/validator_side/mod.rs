@@ -14,6 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
+//! The Validator Side of the Collator Protocol implements specific logic around managing collator
+//! connections in order to ensure that resources are freed up as the relay chain makes progress.
+
+mod peer_slots;
+
 use std::{collections::{HashMap, HashSet}, sync::Arc, task::Poll};
 use std::time::{Duration, Instant};
 use always_assert::never;
@@ -48,10 +53,8 @@ use polkadot_subsystem::{
 
 use crate::error::Fatal;
 
-use super::{
-	peer_slots::{self, PeerSlots, FitnessEvent, Reservoir},
-	Result, LOG_TARGET,
-};
+use peer_slots::{PeerSlots, FitnessEvent, Reservoir};
+use super::{Result, LOG_TARGET};
 
 // How often to check all peers with activity.
 #[cfg(not(test))]
@@ -60,6 +63,7 @@ const ACTIVITY_POLL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const ACTIVITY_POLL: Duration = Duration::from_millis(10);
 
+// Specific Metrics around the Validator Side of the Collator Protocol
 #[derive(Clone, Default)]
 pub struct Metrics(Option<MetricsInner>);
 
@@ -270,11 +274,13 @@ async fn handle_peer_view_change(
 	peer_id: PeerId,
 	view: View,
 ) -> Result<()> {
-	let peer_data = state.peer_slots.peer_data.entry(peer_id.clone()).or_default();
-
-	peer_data.update_view(view);
-	state.requested_collations
-		.retain(|(rp, _, pid), _| pid != &peer_id || !peer_data.has_advertised(&rp));
+	if let Some(peer_data) = state.peer_slots.peer_data.get_mut(&peer_id) {
+		peer_data.update_view(view);
+		state.requested_collations
+			.retain(|(rp, _, pid), _| pid != &peer_id || !peer_data.has_advertised(&rp));
+	} else {
+		unimplemented!{}
+	}
 
 	Ok(())
 }
@@ -431,7 +437,9 @@ where
 				return;
 			}
 
-			for stale_peer_id in peer_slots::sample_connection(&mut state.peer_slots, &origin, &collator_id).await.into_iter() {
+			state.peer_slots.insert_collator(&origin, &collator_id);
+
+			for stale_peer_id in peer_slots::sample_connection(&mut state.peer_slots, &origin).await.into_iter() {
 				disconnect_peer(ctx, stale_peer_id).await;
 			}
 		}
@@ -537,18 +545,13 @@ async fn handle_our_view_change(
 		state.span_per_relay_parent.remove(&removed);
 	}
 
-	// As we handle our view change, we can evict all peers assigned to prior ParaIds
-	// and update the new stale_peers that will get evicted with priority as we sample
-	// our reservoir from the incoming connections.
-	for stale_peer_id in state.peer_slots.stale_peers() {
-		disconnect_peer(ctx, stale_peer_id).await;
-	}
-
-	// Prune advertisements and move outdated peers to stale peers.
-	peer_slots::handle_view_change(&mut state.peer_slots, &state.view);
-
 	// Assign incoming and remove outgoing RelayParents.
 	peer_slots::cycle_para(ctx.sender(), &mut state.peer_slots.active_paras, keystore, added, removed).await;
+
+	// Prune advertisements and move outdated peers to stale peers.
+	for peer_id in peer_slots::handle_view_change(&mut state.peer_slots, &state.view).iter() {
+		disconnect_peer(ctx, *peer_id).await;
+	}
 
 	// Reset sample to ensure that new incoming connections for viable collators are ensured to be
 	// uniformly randomly sampled whenever their parachain becomes assigned.
@@ -572,7 +575,7 @@ where
 
 	match bridge_message {
 		PeerConnected(peer_id, _role, _) => {
-			state.peer_slots.peer_data.entry(peer_id).or_default();
+			peer_slots::handle_connection(&mut state.peer_slots, peer_id);
 			state.metrics.note_collator_peer_count(state.peer_slots.peer_data.len());
 		},
 		PeerDisconnected(peer_id) => {
@@ -938,7 +941,7 @@ mod tests {
 		request_response::Requests
 	};
 
-	use crate::peer_slots::{
+	use super::peer_slots::{
 		BENEFIT_NOTIFY_GOOD, COST_INVALID_SIGNATURE, COST_REPORT_BAD, COST_UNNEEDED_COLLATOR,
 	};
 
