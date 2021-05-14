@@ -437,8 +437,8 @@ where
 				return;
 			}
 
-			state.peer_slots.insert_collator(&origin, &collator_id);
-
+			state.peer_slots.insert_collator(&collator_id);
+			// Sample the peer's connection into the reservoir
 			for stale_peer_id in peer_slots::sample_connection(&mut state.peer_slots, &origin).await.into_iter() {
 				disconnect_peer(ctx, stale_peer_id).await;
 			}
@@ -1163,6 +1163,63 @@ mod tests {
 				let _ = tx.send(Ok(test_state.cores.clone()));
 			}
 		);
+	}
+
+	// As we receive a relevant advertisement act on it and issue a collation request.
+	#[test]
+	fn simulate_reservoir_sample() {
+		let test_state = TestState::default();
+
+		test_harness(|test_harness| async move {
+			let TestHarness {
+				virtual_overseer,
+			} = test_harness;
+
+			tracing::trace!("activating");
+
+			let mut peer_slots = PeerSlots::default();
+
+			for _ in 0..peer_slots::RESERVOIR_SIZE {
+				let peer_id = PeerId::random();
+				peer_slots::handle_connection(&mut peer_slots, peer_id.clone());
+				assert_eq!(peer_slots::sample_connection(&mut peer_slots, &peer_id).await, vec![]);
+			}
+
+			let mut count = 0;
+			for _ in 0..peer_slots::RESERVOIR_SIZE.pow(2) {
+				let peer_id = PeerId::random();
+				peer_slots::handle_connection(&mut peer_slots, peer_id.clone());
+				let peers_to_evict = peer_slots::sample_connection(&mut peer_slots, &peer_id).await;
+				assert_eq!(peers_to_evict.len(), 1);
+				let _ = peer_slots.peer_data.remove(&peers_to_evict[0])
+					.expect("The reservoir is full, therefore at least one peer must get evicted");
+				if peer_id == peers_to_evict[0] {
+					count += 1;
+				}
+
+			}
+			assert!(count != 0);
+			let keys: Vec<PeerId> = peer_slots.peer_data.keys().map(|a| a.clone()).collect();
+			let reservoir_sqrt = (peer_slots::RESERVOIR_SIZE as f64).sqrt() as u64;
+			for _ in 0..peer_slots::RESERVOIR_SIZE {
+				count = 0;
+				for key in keys.iter() {
+					let peer_id = PeerId::random();
+					peer_slots::handle_connection(&mut peer_slots, peer_id.clone());
+					peer_slots::_insert_event(&mut peer_slots, key, &test_state.collators[0].public(), FitnessEvent::Unexpected);
+					let peers_to_evict = peer_slots::sample_connection(&mut peer_slots, &peer_id).await;
+					let _ = peer_slots.peer_data.remove(&peers_to_evict[0])
+						.expect("The reservoir is full, therefore at least one peer must get evicted qed");
+					if key != &peers_to_evict[0] && &peer_id != &peers_to_evict[0] {
+						count += 1;
+					}
+				}
+				
+				assert!(count <  reservoir_sqrt);
+			}
+
+			virtual_overseer
+		});
 	}
 
 	// As we receive a relevant advertisement act on it and issue a collation request.

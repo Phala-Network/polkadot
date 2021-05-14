@@ -31,9 +31,15 @@ use polkadot_subsystem::{messages::{AllMessages, NetworkBridgeMessage}, Subsyste
 // CACHE_SIZE determines the size (in number of entries) of in-memory cache maintained for the
 // purposes of determining a collator's fitness. Metrics for collators that do not fit in the
 // Cache are stored in a database.
+#[cfg(not(test))]
 const CACHE_SIZE: usize = 10_000;
+#[cfg(test)]
+pub(super) const CACHE_SIZE: usize = 10;
 // RESERVOIR SIZE determines the upper bound on the number of collator connections
+#[cfg(not(test))]
 const RESERVOIR_SIZE: usize = 1_000;
+#[cfg(test)]
+pub(super) const RESERVOIR_SIZE: usize = 100;
 
 /// Message was went out-of-order
 const COST_UNEXPECTED_MESSAGE: Rep = Rep::CostMinor("An unexpected message");
@@ -478,12 +484,15 @@ impl std::fmt::Debug for PeerSlots {
 }
 
 impl PeerSlots {
-	pub fn insert_collator(&mut self, peer_id: &PeerId, collator_id: &CollatorId) {
+	pub fn insert_collator(&mut self, collator_id: &CollatorId) {
 		if self.fitness.get(collator_id).is_none() {
 			self.fitness.put(collator_id.clone(), CollatorFitnessMetric::default());
-		}
-		
+		} 
+	}
+
+	pub fn reprioritize(&mut self, peer_id: &PeerId, collator_id: &CollatorId) {
 		let mut peer_fitness = 0f64;
+		let mut temp_slot_idx = 0;
 		let mut slot_idx = 0;
 
 		if let Some(peer_data) = self.peer_data.get(peer_id) {
@@ -491,16 +500,15 @@ impl PeerSlots {
 			if let Some(fitness) = self.fitness.get(collator_id) {
 				peer_fitness = fitness.compute_fitness();
 			}
+
 		}
-	   
-		let mut temp_slot_idx = 0;
+
 		for i in 0..slot_idx {
 			if let Some(temp_peer_id) = self.peers.get(i) {
 				if let Some(temp_peer_data) = self.peer_data.get_mut(temp_peer_id) {
 					if let Some(temp_collator_id) = temp_peer_data.collator_id() {
 						if let Some(temp_peer_fitness_metric) = self.fitness.get(temp_collator_id) {
-							let temp_peer_fitness = temp_peer_fitness_metric.compute_fitness();
-							if peer_fitness < temp_peer_fitness {
+							if peer_fitness < temp_peer_fitness_metric.compute_fitness() {
 								temp_peer_data.slot_idx = slot_idx;
 								temp_slot_idx = i;
 								break;
@@ -643,6 +651,23 @@ pub fn handle_connection(
 	peer_slots.peers.push(peer_id);
 }
 
+pub fn _insert_event(
+	peer_slots: &mut PeerSlots,
+	peer_id: &PeerId,
+	collator_id: &CollatorId,
+	event: FitnessEvent,
+) {
+	if let Some(metric) = peer_slots.fitness.get_mut(collator_id) {
+		metric.insert_event(event);
+	} else {
+		let mut metric = CollatorFitnessMetric::default();
+		metric.insert_event(event);
+		peer_slots.fitness.put(collator_id.clone(), metric);
+	}
+
+	peer_slots.reprioritize(peer_id, collator_id);
+}
+
 pub async fn insert_event<Context>(
 	ctx: &mut Context,
 	peer_slots: &mut PeerSlots,
@@ -653,13 +678,7 @@ pub async fn insert_event<Context>(
 	Context: SubsystemContext<Message = CollatorProtocolMessage>,
 {
 	modify_reputation(ctx, *peer_id, COLLATOR_METRICS[event as usize]).await;
-	if let Some(metric) = peer_slots.fitness.get_mut(collator_id) {
-		metric.insert_event(event);
-	} else {
-		let mut metric = CollatorFitnessMetric::default();
-		metric.insert_event(event);
-		peer_slots.fitness.put(collator_id.clone(), metric);
-	}
+	_insert_event(peer_slots, peer_id, collator_id, event);
 }
 
 /// Modify the reputation of a peer based on its behavior.
