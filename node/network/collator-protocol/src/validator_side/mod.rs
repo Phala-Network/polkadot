@@ -962,6 +962,12 @@ mod tests {
 
 	impl Default for TestState {
 		fn default() -> Self {
+			Self::new(4)
+		}
+	}
+
+	impl TestState {
+		fn new(num_collators: usize) -> Self {
 			let chain_a = ParaId::from(1);
 			let chain_b = ParaId::from(2);
 
@@ -969,7 +975,7 @@ mod tests {
 			let relay_parent = Hash::repeat_byte(0x05);
 			let collators = iter::repeat(())
 				.map(|_| CollatorPair::generate().0)
-				.take(4)
+				.take(num_collators)
 				.collect();
 
 			let validators = vec![
@@ -1166,9 +1172,11 @@ mod tests {
 	}
 
 	// As we receive a relevant advertisement act on it and issue a collation request.
+	// Monte Carlo simulation for the reservoir sampling algorithm to ensure our peer slots are
+	// chosen uniformly at random across Declaring collators.
 	#[test]
 	fn simulate_reservoir_sample() {
-		let test_state = TestState::default();
+		let test_state = TestState::new(2*peer_slots::RESERVOIR_SIZE);
 
 		test_harness(|test_harness| async move {
 			let TestHarness {
@@ -1179,40 +1187,72 @@ mod tests {
 
 			let mut peer_slots = PeerSlots::default();
 
-			for _ in 0..peer_slots::RESERVOIR_SIZE {
+			for i in 0..peer_slots::RESERVOIR_SIZE {
 				let peer_id = PeerId::random();
 				peer_slots::handle_connection(&mut peer_slots, peer_id.clone());
+				let collator_id = test_state.collators[i].public();
+				if let Some(peer_data) = peer_slots.peer_data.get_mut(&peer_id) {
+					peer_data.set_collating(&collator_id, &ParaId::from(1));
+				}
+				peer_slots::_insert_event(&mut peer_slots, &peer_id, &collator_id, FitnessEvent::Unexpected);
 				assert_eq!(peer_slots::sample_connection(&mut peer_slots, &peer_id).await, vec![]);
 			}
 
 			let mut count = 0;
-			for _ in 0..peer_slots::RESERVOIR_SIZE.pow(2) {
+			for i in 0..peer_slots::RESERVOIR_SIZE.pow(2) {
 				let peer_id = PeerId::random();
 				peer_slots::handle_connection(&mut peer_slots, peer_id.clone());
-				let peers_to_evict = peer_slots::sample_connection(&mut peer_slots, &peer_id).await;
-				assert_eq!(peers_to_evict.len(), 1);
-				let _ = peer_slots.peer_data.remove(&peers_to_evict[0])
-					.expect("The reservoir is full, therefore at least one peer must get evicted");
-				if peer_id == peers_to_evict[0] {
-					count += 1;
+				peer_slots::_insert_event(
+					&mut peer_slots,
+					&peer_id,
+					&test_state.collators[i % peer_slots::RESERVOIR_SIZE].public(),
+					FitnessEvent::Unexpected
+				);
+				for peer_to_evict in peer_slots::sample_connection(&mut peer_slots, &peer_id).await.iter() {
+					let _ = peer_slots.peer_data.remove(peer_to_evict)
+						.expect("The reservoir is full, therefore at least one peer must get evicted qed");
+					if &peer_id == peer_to_evict {
+						count += 1;
+					} else {
+						let collator_id = test_state.collators[
+							peer_slots::RESERVOIR_SIZE + i % peer_slots::RESERVOIR_SIZE
+						].public();
+						if let Some(peer_data) = peer_slots.peer_data.get_mut(&peer_id) {
+							peer_data.set_collating(&collator_id, &ParaId::from(2));
+						}
+					}
 				}
 
 			}
+
 			assert!(count != 0);
 			let keys: Vec<PeerId> = peer_slots.peer_data.keys().map(|a| a.clone()).collect();
 			let reservoir_sqrt = (peer_slots::RESERVOIR_SIZE as f64).sqrt() as u64;
-			for _ in 0..peer_slots::RESERVOIR_SIZE {
+			for i in 0..peer_slots::RESERVOIR_SIZE {
 				count = 0;
+				let mut offset = 0;
 				for key in keys.iter() {
 					let peer_id = PeerId::random();
 					peer_slots::handle_connection(&mut peer_slots, peer_id.clone());
-					peer_slots::_insert_event(&mut peer_slots, key, &test_state.collators[0].public(), FitnessEvent::Unexpected);
-					let peers_to_evict = peer_slots::sample_connection(&mut peer_slots, &peer_id).await;
-					let _ = peer_slots.peer_data.remove(&peers_to_evict[0])
-						.expect("The reservoir is full, therefore at least one peer must get evicted qed");
-					if key != &peers_to_evict[0] && &peer_id != &peers_to_evict[0] {
-						count += 1;
+					let collator_id = &test_state.collators[offset].public();
+					for _ in 0..i {
+						peer_slots::_insert_event(
+							&mut peer_slots, key, &collator_id, FitnessEvent::Unexpected
+						);
 					}
+					for peer_to_evict in peer_slots::sample_connection(&mut peer_slots, &peer_id)
+						.await.iter()
+					{
+						let _ = peer_slots.peer_data.remove(peer_to_evict)
+							.expect(
+								r#"The reservoir is full,
+									therefore at least one peer must get evicted qed"#
+							);
+						if key != peer_to_evict && &peer_id != peer_to_evict {
+							count += 1;
+						}
+					}
+					offset += 1;
 				}
 				
 				assert!(count <  reservoir_sqrt);
