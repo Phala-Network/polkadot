@@ -39,7 +39,7 @@ pub(super) const CACHE_SIZE: usize = 10;
 #[cfg(not(test))]
 const RESERVOIR_SIZE: usize = 1_000;
 #[cfg(test)]
-pub(super) const RESERVOIR_SIZE: usize = 100;
+pub(super) const RESERVOIR_SIZE: usize = 50;
 
 /// Message was went out-of-order
 const COST_UNEXPECTED_MESSAGE: Rep = Rep::CostMinor("An unexpected message");
@@ -134,7 +134,7 @@ impl FitnessMetric {
 
 	pub fn fitness(&self) -> f64 {
 		if self.total != 0 {
-			self.cumulative.as_secs() as f64 / self.total as f64
+			self.total as f64 / self.cumulative.as_nanos() as f64
 		} else {
 			0f64
 		}
@@ -202,7 +202,7 @@ enum PeerState {
 }
 
 #[derive(Debug)]
-pub(crate) struct PeerData {
+pub(super) struct PeerData {
 	view: View,
 	state: PeerState,
 	slot_idx: usize,
@@ -317,14 +317,14 @@ struct GroupAssignments {
 }
 
 #[derive(Default)]
-pub(crate) struct ActiveParas {
+pub(super) struct ActiveParas {
 	relay_parent_assignments: HashMap<Hash, GroupAssignments>,
 	current_assignments: HashMap<ParaId, usize>,
 	next_assignments: HashMap<ParaId, usize>
 }
 
 impl ActiveParas {
-	pub(crate) async fn assign_incoming(
+	pub(super) async fn assign_incoming(
 		&mut self,
 		sender: &mut impl SubsystemSender,
 		keystore: &SyncCryptoStorePtr,
@@ -419,7 +419,7 @@ impl ActiveParas {
 		}
 	}
 
-	pub(crate) fn remove_outgoing(
+	pub(super) fn remove_outgoing(
 		&mut self,
 		old_relay_parents: impl IntoIterator<Item = Hash>,
 	) {
@@ -448,21 +448,21 @@ impl ActiveParas {
 		}
 	}
 
-	pub(crate) fn is_current_or_next(&self, id: ParaId) -> bool {
+	pub(super) fn is_current_or_next(&self, id: ParaId) -> bool {
 		self.current_assignments.contains_key(&id) || self.next_assignments.contains_key(&id)
 	}
 }
 
-pub(crate) type CollatorFitness = lru::LruCache<CollatorId, CollatorFitnessMetric>;
+pub(super) type CollatorFitness = lru::LruCache<CollatorId, CollatorFitnessMetric>;
 
-pub(crate) type Reservoir = HashMap<PeerId, PeerData>;
+pub(super) type Reservoir = HashMap<PeerId, PeerData>;
 
 pub struct PeerSlots {
 	seq_nr: u64,
-	pub(crate) fitness: CollatorFitness,
-	pub(crate) peer_data: Reservoir,
-	pub(crate) active_paras: ActiveParas,
-	peers: Vec<PeerId>,
+	pub(super) fitness: CollatorFitness,
+	pub(super) peer_data: Reservoir,
+	pub(super) active_paras: ActiveParas,
+	pub(super) peers: Vec<PeerId>,
 }
 
 impl Default for PeerSlots {
@@ -490,9 +490,8 @@ impl PeerSlots {
 		} 
 	}
 
-	pub fn reprioritize(&mut self, peer_id: &PeerId, collator_id: &CollatorId) {
+	pub fn reprioritize(&mut self, peer_id: &PeerId, collator_id: &CollatorId) -> Vec<(PeerId, usize)> {
 		let mut peer_fitness = 0f64;
-		let mut temp_slot_idx = 0;
 		let mut slot_idx = 0;
 
 		if let Some(peer_data) = self.peer_data.get(peer_id) {
@@ -502,15 +501,20 @@ impl PeerSlots {
 			}
 
 		}
-
-		for i in 0..slot_idx {
-			if let Some(temp_peer_id) = self.peers.get(i) {
+		
+		let mut updates = Vec::new();
+		let mut reached_end = true;
+		let end = self.peers.len() - 1;
+		for temp_slot_idx in slot_idx..end {
+			if let Some(temp_peer_id) = self.peers.get(temp_slot_idx + 1) {
 				if let Some(temp_peer_data) = self.peer_data.get_mut(temp_peer_id) {
 					if let Some(temp_collator_id) = temp_peer_data.collator_id() {
 						if let Some(temp_peer_fitness_metric) = self.fitness.get(temp_collator_id) {
-							if peer_fitness < temp_peer_fitness_metric.compute_fitness() {
-								temp_peer_data.slot_idx = slot_idx;
-								temp_slot_idx = i;
+							if peer_fitness > temp_peer_fitness_metric.compute_fitness() {
+								updates.push((*temp_peer_id, temp_slot_idx));
+							} else {
+								slot_idx = temp_slot_idx;
+								reached_end = false;
 								break;
 							}
 						}
@@ -519,11 +523,14 @@ impl PeerSlots {
 			}
 		}
 
-		self.peers.swap(slot_idx, temp_slot_idx);
-
-		if let Some(peer_data) = self.peer_data.get_mut(peer_id) {
-			peer_data.slot_idx = temp_slot_idx;
+		if !reached_end {
+			updates.push((*peer_id, slot_idx));
+		} else if end > 0 {
+			updates.push((self.peers[end].clone(), end-1));
+			updates.push((*peer_id, end));
 		}
+
+		updates
 	}
 
 	pub fn reset_sample(&mut self) {
@@ -531,7 +538,7 @@ impl PeerSlots {
 	}
 }
 
-pub(crate) fn handle_view_change(peer_slots: &mut PeerSlots, view: &View) -> Vec<PeerId> {
+pub(super) fn handle_view_change(peer_slots: &mut PeerSlots, view: &View) -> Vec<PeerId> {
 	let mut out = Vec::new();
 	for (peer_id, peer_data) in peer_slots.peer_data.iter_mut() {
 		peer_data.prune_old_advertisements(view);
@@ -545,7 +552,7 @@ pub(crate) fn handle_view_change(peer_slots: &mut PeerSlots, view: &View) -> Vec
 	out
 }
 
-pub(crate) async fn cycle_para(
+pub(super) async fn cycle_para(
 	sender: &mut impl SubsystemSender,
 	active_paras: &mut ActiveParas,
 	keystore: &SyncCryptoStorePtr,
@@ -577,20 +584,21 @@ pub async fn sample_connection(
 	peer_slots: &mut PeerSlots,
 	peer_id: &PeerId,
 ) -> Vec<PeerId> {
+	let mut out: Vec<PeerId> = Vec::new();
 	// Since we cannot intercept incoming connections yet, we must remove the connected peer from
 	// peer_data in order to ensure we do not accidentally schedule them for eviction unless they
 	// are not sampled for this seq_nr's reservoir
 	//
 	// To that effect, we will remove the peer from peer_data and insert them back after we've
 	// sampled our eviction candidates
-	if let Some(peer_data) = peer_slots.peer_data.get(peer_id) {
+	let collator_id = if let Some(peer_data) = peer_slots.peer_data.get(peer_id) {
 		// All peers except the Declaring one
 		let total_peers = peer_slots.peer_data.len();
-
 		// Determine how many peer we need to evict
 		let surplus_peers = total_peers.saturating_sub(RESERVOIR_SIZE);
 
 		// Take the worst performing peer and store them at height of the declaring peer
+		let n = peer_slots.peers.len();
 		peer_slots.peers.swap(total_peers - 1, peer_data.slot_idx);
 		let _ = peer_slots.peers.pop();
 
@@ -599,7 +607,9 @@ pub async fn sample_connection(
 		peer_slots.seq_nr += 1;
 
 		// Evict the worst peers
-		let mut out: Vec<PeerId> = peer_slots.peers.drain(total_peers - surplus_peers - 1 ..).collect();
+		if total_peers - surplus_peers < peer_slots.peers.len() {
+			out = peer_slots.peers.drain(total_peers - surplus_peers - 1..).collect();
+		};
 
 		let mut rng = thread_rng();
 
@@ -614,20 +624,22 @@ pub async fn sample_connection(
 				// The worst behaving peer sits at slot_idx.
 				// If slot_idx less than delta, then we must swap with available_slot.
 				// Otherwise, the worst behaving peer will get evicted
-				if peer_data.slot_idx < total_peers - surplus_peers {
+				if peer_data.slot_idx < total_peers - surplus_peers - 1 {
 					// Push worst performing peer into output
 					out.push(peer_slots.peers[peer_data.slot_idx]);
 					// Reinstate declaring peer in peer list
 					peer_slots.peers[peer_data.slot_idx] = *peer_id;
+					peer_slots.peers.push(available_slot);
 				} else {
-					// Declaring peer is now the worst performing peer
 					peer_slots.peers.push(*peer_id);
+					peer_slots.peers.push(available_slot);
 				}
-				// Evict available_slot
-				out.push(available_slot);
 			} else {
 				// Reinstate available_slot in our peer list
 				peer_slots.peers.push(available_slot);
+				if let Some(reinstate) = out.pop() {
+					peer_slots.peers.push(reinstate);
+				}
 				// Evict Declaring peer
 				out.push(*peer_id);
 			}
@@ -636,11 +648,22 @@ pub async fn sample_connection(
 			peer_slots.peers.push(*peer_id);
 			peer_slots.peers.swap(peer_data.slot_idx, total_peers - 1);
 		}
+		peer_data.collator_id().map(|v| v.clone())
+	} else {
+		None
+	};
 
-		return out;
+	if let Some(collator_id) = collator_id {
+		for (peer_id, slot_idx) in peer_slots.reprioritize(peer_id, &collator_id).iter() {
+			if let Some(peer_data) = peer_slots.peer_data.get_mut(peer_id) {
+				let slot = *slot_idx;
+				peer_slots.peers[slot] = *peer_id;
+				peer_data.slot_idx = slot;
+			}
+		}
 	}
 
-	vec![]
+	out
 }
 
 pub fn handle_connection(
@@ -664,8 +687,14 @@ pub fn _insert_event(
 		metric.insert_event(event);
 		peer_slots.fitness.put(collator_id.clone(), metric);
 	}
+	for (peer_id, slot_idx) in peer_slots.reprioritize(peer_id, collator_id).iter() {
+		if let Some(peer_data) = peer_slots.peer_data.get_mut(peer_id) {
+			let slot = *slot_idx;
+			peer_slots.peers[slot] = *peer_id;
+			peer_data.slot_idx = slot;
+		}
+	}
 
-	peer_slots.reprioritize(peer_id, collator_id);
 }
 
 pub async fn insert_event<Context>(
@@ -697,4 +726,52 @@ where
 	ctx.send_message(AllMessages::NetworkBridge(
 		NetworkBridgeMessage::ReportPeer(peer, rep),
 	)).await;
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::time::Duration;
+	use std::thread::sleep;
+	use polkadot_primitives::v1::CollatorPair;
+	use sp_core::Pair;
+
+	#[test]
+	fn test_reprioritize() {
+		let mut peer_slots = PeerSlots::default();
+		let collators: Vec<CollatorPair> = std::iter::repeat(())
+				.map(|_| CollatorPair::generate().0)
+				.take(RESERVOIR_SIZE)
+				.collect();
+		let mut ids = Vec::new();
+
+		// Connect all collators into peer slots
+		for collator in collators.iter() {
+			let peer_id = PeerId::random();
+			handle_connection(&mut peer_slots, peer_id.clone());
+			let collator_id = collator.public();
+			ids.push((peer_id, collator_id));
+		}
+
+		// Traverse list of ids and register Collator Id
+		for id in ids.iter() {
+			let peer_data = peer_slots.peer_data.get_mut(&id.0).unwrap();
+			peer_data.set_collating(&id.1, &ParaId::from(1));
+			peer_slots.insert_collator(&id.1);
+		}
+
+		// Trigger an event
+		for id in ids.iter() {
+			sleep(Duration::new(0, 100));
+			_insert_event(&mut peer_slots, &id.0, &id.1, FitnessEvent::Unexpected);
+			for (peer_id, peer_data) in peer_slots.peer_data.iter() {
+				assert_eq!(&peer_slots.peers[peer_data.slot_idx], peer_id);
+			}
+		}
+
+		// Ensure that the priority of users is now reversed, i.e. the first peer to misbehave is
+		// the last in the peers list and will therefore be evicted first
+		let reverse: Vec<PeerId> = ids.iter().map(|(a,_)| a.clone()).rev().collect();
+		assert_eq!(reverse, peer_slots.peers);
+	}
 }
