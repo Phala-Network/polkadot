@@ -50,7 +50,6 @@ use polkadot_subsystem::{
 	},
 	FromOverseer, OverseerSignal, PerLeafSpan, SubsystemContext,
 };
-use rand::Rng;
 
 use crate::error::Fatal;
 
@@ -84,7 +83,9 @@ impl Metrics {
 	}
 
 	/// Provide a timer for `handle_collation_request_result` which observes on drop.
-	fn time_handle_collation_request_result(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
+	fn time_handle_collation_request_result(
+		&self
+	) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
 		self.0.as_ref().map(|metrics| metrics.handle_collation_request_result.start_timer())
 	}
 
@@ -249,7 +250,10 @@ async fn notify_collation_seconded(
 	}
 
 	if let Some(peer_id) = collator_peer_id(peer_data, &id) {
-		let wire_message = protocol_v1::CollatorProtocolMessage::CollationSeconded(relay_parent, statement.into());
+		let wire_message = protocol_v1::CollatorProtocolMessage::CollationSeconded(
+			relay_parent,
+			statement.into()
+		);
 
 		ctx.send_message(AllMessages::NetworkBridge(
 			NetworkBridgeMessage::SendCollationMessage(
@@ -393,26 +397,46 @@ where
 	match msg {
 		Declare(collator_id, para_id, signature) => {
 			if collator_peer_id(&state.peer_slots.peer_data, &collator_id).is_some() {
-				peer_slots::insert_event(ctx, &mut state.peer_slots, &origin, &collator_id, FitnessEvent::Unexpected).await;
-				return;
+				return peer_slots::insert_event(
+					ctx,
+					&mut state.peer_slots,
+					&origin,
+					&collator_id,
+					FitnessEvent::Unexpected
+				).await;
 			}
 
 			let peer_data = match state.peer_slots.peer_data.get_mut(&origin) {
 				Some(p) => p,
 				None => {
-					peer_slots::insert_event(ctx, &mut state.peer_slots, &origin, &collator_id, FitnessEvent::Unexpected).await;
-					return;
+					return peer_slots::insert_event(
+						ctx,
+						&mut state.peer_slots,
+						&origin,
+						&collator_id,
+						FitnessEvent::Unexpected
+					).await;
 				}
 			};
 
 			if peer_data.is_collating() {
-				peer_slots::insert_event(ctx, &mut state.peer_slots, &origin, &collator_id, FitnessEvent::Unexpected).await;
-				return;
+				return peer_slots::insert_event(
+					ctx,
+					&mut state.peer_slots,
+					&origin,
+					&collator_id,
+					FitnessEvent::Unexpected,
+				).await;
 			}
 
 			if !signature.verify(&*protocol_v1::declare_signature_payload(&origin), &collator_id) {
-				peer_slots::insert_event(ctx, &mut state.peer_slots, &origin, &collator_id, FitnessEvent::SigError).await;
-				return;
+				return peer_slots::insert_event(
+					ctx,
+					&mut state.peer_slots,
+					&origin,
+					&collator_id,
+					FitnessEvent::SigError,
+				).await;
 			}
 
 			if state.peer_slots.active_paras.is_current_or_next(para_id) {
@@ -433,19 +457,30 @@ where
 					?para_id,
 					"Declared as collator for unneeded para",
 				);
-				peer_slots::insert_event(ctx, &mut state.peer_slots, &origin, &collator_id, FitnessEvent::Superfluous).await;
+				peer_slots::insert_event(
+					ctx,
+					&mut state.peer_slots,
+					&origin,
+					&collator_id,
+					FitnessEvent::Superfluous,
+				).await;
 				disconnect_peer(ctx, origin).await;
 				return;
 			}
 
 			state.peer_slots.insert_collator(&collator_id);
 			// Sample the peer's connection into the reservoir
-			for stale_peer_id in peer_slots::sample_connection(&mut state.peer_slots, &origin).await.into_iter() {
+			for stale_peer_id in
+				peer_slots::sample_connection(&mut state.peer_slots, &origin).into_iter()
+			{
 				disconnect_peer(ctx, stale_peer_id).await;
 			}
 		}
 		AdvertiseCollation(relay_parent) => {
-			let _span = state.span_per_relay_parent.get(&relay_parent).map(|s| s.child("advertise-collation"));
+			let _span = state
+				.span_per_relay_parent
+				.get(&relay_parent)
+				.map(|s| s.child("advertise-collation"));
 
 			if !state.view.contains(&relay_parent) {
 				tracing::debug!(
@@ -455,12 +490,22 @@ where
 					"Advertise collation out of view",
 				);
 
-				return insert_event_by_peer_id(ctx, &mut state.peer_slots, &origin, FitnessEvent::Unexpected).await;
+				return insert_event_by_peer_id(
+					ctx,
+					&mut state.peer_slots,
+					&origin,
+					FitnessEvent::Unexpected
+				).await;
 			}
 
 			let peer_data = match state.peer_slots.peer_data.get_mut(&origin) {
 				None => {
-					return insert_event_by_peer_id(ctx, &mut state.peer_slots, &origin, FitnessEvent::Unexpected).await;
+					return insert_event_by_peer_id(
+						ctx,
+						&mut state.peer_slots,
+						&origin,
+						FitnessEvent::Unexpected
+					).await;
 				}
 				Some(p) => p,
 			};
@@ -485,7 +530,12 @@ where
 						error = ?e,
 						"Invalid advertisement",
 					);
-					return insert_event_by_peer_id(ctx, &mut state.peer_slots, &origin, FitnessEvent::Unexpected).await;
+					return insert_event_by_peer_id(
+						ctx,
+						&mut state.peer_slots,
+						&origin,
+						FitnessEvent::Unexpected,
+					).await;
 				}
 			}
 		}
@@ -495,7 +545,12 @@ where
 				peer_id = ?origin,
 				"Unexpected `CollationSeconded` message, decreasing reputation",
 			);
-			return insert_event_by_peer_id(ctx, &mut state.peer_slots, &origin, FitnessEvent::Unexpected).await;
+			return insert_event_by_peer_id(
+				ctx,
+				&mut state.peer_slots,
+				&origin,
+				FitnessEvent::Unexpected,
+			).await;
 		}
 	}
 }
@@ -547,7 +602,13 @@ async fn handle_our_view_change(
 	}
 
 	// Assign incoming and remove outgoing RelayParents.
-	peer_slots::cycle_para(ctx.sender(), &mut state.peer_slots.active_paras, keystore, added, removed).await;
+	peer_slots::cycle_para(
+		ctx.sender(),
+		&mut state.peer_slots.active_paras,
+		keystore,
+		added,
+		removed
+	).await;
 
 	// Prune advertisements and move outdated peers to stale peers.
 	for peer_id in peer_slots::handle_view_change(&mut state.peer_slots, &state.view).iter() {
@@ -627,21 +688,42 @@ where
 			);
 		}
 		FetchCollation(relay_parent, collator_id, para_id, tx) => {
-			let _span = state.span_per_relay_parent.get(&relay_parent).map(|s| s.child("fetch-collation"));
+			let _span = state
+				.span_per_relay_parent
+				.get(&relay_parent)
+				.map(|s| s.child("fetch-collation"));
 			fetch_collation(ctx, state, relay_parent, &collator_id, para_id, tx).await;
 		}
 		ReportCollator(collator_id) => {
 			if let Some(origin) = collator_peer_id(&state.peer_slots.peer_data, &collator_id) {
-				peer_slots::insert_event(ctx, &mut state.peer_slots, &origin, &collator_id, FitnessEvent::ReportBad).await;
+				peer_slots::insert_event(
+					ctx,
+					&mut state.peer_slots,
+					&origin,
+					&collator_id,
+					FitnessEvent::ReportBad
+				).await;
 			}
 		}
 		NoteGoodCollation(collator_id) => {
 			if let Some(origin) = collator_peer_id(&state.peer_slots.peer_data, &collator_id) {
-				peer_slots::insert_event(ctx, &mut state.peer_slots, &origin, &collator_id, FitnessEvent::NotifyGood).await;
+				peer_slots::insert_event(
+					ctx,
+					&mut state.peer_slots,
+					&origin,
+					&collator_id,
+					FitnessEvent::NotifyGood
+				).await;
 			}
 		}
 		NotifyCollationSeconded(collator_id, relay_parent, statement) => {
-			notify_collation_seconded(ctx, &state.peer_slots.peer_data, collator_id, relay_parent, statement).await;
+			notify_collation_seconded(
+				ctx,
+				&state.peer_slots.peer_data,
+				collator_id,
+				relay_parent,
+				statement
+			).await;
 		}
 		NetworkBridgeUpdateV1(event) => {
 			if let Err(e) = handle_network_msg(
@@ -929,6 +1011,7 @@ mod tests {
 	use sp_keystore::testing::KeyStore as TestKeyStore;
 	use sp_keyring::Sr25519Keyring;
 	use assert_matches::assert_matches;
+	use rand::Rng;
 
 	use polkadot_primitives::v1::{
 		CollatorPair, ValidatorId, ValidatorIndex, CoreState, CandidateDescriptor,
@@ -1177,7 +1260,7 @@ mod tests {
 	// chosen uniformly at random across Declaring collators.
 	#[test]
 	fn simulate_reservoir_sample() {
-		let test_state = TestState::new(peer_slots::RESERVOIR_SIZE + peer_slots::RESERVOIR_SIZE.pow(2));
+		let test_state = TestState::new(peer_slots::RESERVOIR_SIZE + peer_slots::RESERVOIR_SIZE*10);
 
 		test_harness(|test_harness| async move {
 			let TestHarness {
@@ -1206,12 +1289,12 @@ mod tests {
 				// Insert event to ensure non-zero fitness
 				peer_slots::_insert_event(&mut peer_slots, &peer_id, &collator_id, FitnessEvent::Unexpected);
 				// Assert that peer is not rejected when reservoir is empty
-				assert_eq!(peer_slots::sample_connection(&mut peer_slots, &peer_id).await, vec![]);
+				assert_eq!(peer_slots.sample_connection(&peer_id).0, vec![]);
 			}
 
 			// NOTE: Reservoir is now full. We want to keep track of the number of disconnected
 			// peers with count in order to ensure that at least one incoming peer was rejected
-			let mut count: u64 = 0;
+			let mut count = 0u64;
 			// Simulate a significant over-subscription of the reservoir size by squaring, that is
 			// we will have RESERVOIR_SIZE as many connections as the size of our (already full)
 			// reservoir
@@ -1235,19 +1318,21 @@ mod tests {
 					FitnessEvent::Unexpected
 				);
 				// Simulate actual reservoir sampling
-				for peer_to_evict in peer_slots::sample_connection(&mut peer_slots, &peer_id).await.iter() {
+				for peer_to_evict in peer_slots.sample_connection(&peer_id).0.into_iter() {
 					// If peer_to_evict does not match peer_id, then we are rejecting an incoming
 					// connection and we want to ensure this happens at least once. Since the
 					// reservoir is full, this will happen with high probability
-					if &peer_id == peer_to_evict {
+					if peer_id == peer_to_evict {
 						count += 1;
 					} else {
 						// Remember peer id if we are not evicting the newly connecting peer
 						peer_ids.push(peer_id);
 					}
 					// Evict peer
-					let _ = peer_slots.peer_data.remove(peer_to_evict).unwrap();
-
+					let _ = peer_slots.peer_data.remove(&peer_to_evict).unwrap();
+					for (peer_id, peer_data) in peer_slots.peer_data.iter() {
+						assert_eq!(&peer_slots.peers[peer_data.slot_idx], peer_id);
+					}
 				}
 
 			}
@@ -1265,16 +1350,13 @@ mod tests {
 			for (peer_id, collator_id) in peers.iter() {
 				let sample: usize = rng.gen_range(0..peer_slots::RESERVOIR_SIZE);
 				for _ in 0..sample {
-					std::thread::sleep(std::time::Duration::new(0, rng.gen::<u8>().into()));
 					peer_slots::_insert_event(
 						&mut peer_slots, peer_id, collator_id, FitnessEvent::Unexpected
 					);
 				}
 			}
 
-			let keys: Vec<PeerId> = peer_slots.peer_data.keys().map(|a| a.clone()).collect();
-			let reservoir_sqrt = (peer_slots::RESERVOIR_SIZE as f64).sqrt() as u64;
-			for peer_id in peer_ids.iter() {
+			for peer_id in peer_ids[peer_slots::RESERVOIR_SIZE..].iter() {
 				// Reset count. Now keep track of occurrences where we don't evict the worst peer
 				count = 0;
 				let mut offset = 0;
@@ -1282,12 +1364,18 @@ mod tests {
 				peer_slots::_insert_event(
 					&mut peer_slots, peer_id, &test_state.collators[offset].public(), FitnessEvent::Unexpected
 				);
+				let keys: Vec<PeerId> = peer_slots.peer_data.keys().map(|a| a.clone()).collect();
 				for key in keys.iter() {
-					peer_slots::handle_connection(&mut peer_slots, key.clone());
+					assert_eq!(peer_slots.peer_data.len(), peer_slots.peers.len());
+					peer_slots::handle_connection(&mut peer_slots, peer_id.clone());
 					let worst_peer = peer_slots.peers[peer_slots.peers.len() - 1].clone();
-					for peer_to_evict in peer_slots::sample_connection(&mut peer_slots, key)
-						.await.iter()
+					for peer_to_evict in peer_slots.sample_connection(peer_id).0.iter()
 					{
+						peer_slots.peer_data.remove(peer_to_evict).unwrap();
+						for (peer_id, peer_data) in peer_slots.peer_data.iter() {
+							assert_eq!(&peer_slots.peers[peer_data.slot_idx], peer_id);
+						}
+
 						// Ensure we are either evicting the sampling peer or the worst performing
 						// peer
 						if key != peer_to_evict && &worst_peer != peer_to_evict {
@@ -1298,9 +1386,44 @@ mod tests {
 					offset += 1;
 				}
 
-				// We should never evict anyone other than the worst performing peer or the sampling
-				// one
-				assert!(count < reservoir_sqrt);
+				// We should never evict anyone other than the sampling or worst performing peer
+				assert_eq!(count, 0);
+			}
+
+			peer_slots.reset_sample();
+
+			for peer_id in peer_ids[peer_slots::RESERVOIR_SIZE..].iter() {
+				// Reset count. Now keep track of occurrences where we don't evict the worst peer
+				count = 0;
+				let mut offset = 0;
+				// Insert a new event for good measure
+				peer_slots::_insert_event(
+					&mut peer_slots, peer_id, &test_state.collators[offset].public(), FitnessEvent::Unexpected
+				);
+				let keys: Vec<PeerId> = peer_slots.peer_data.keys().map(|a| a.clone()).collect();
+				for _ in keys.iter() {
+					assert_eq!(peer_slots.peer_data.len(), peer_slots.peers.len());
+					peer_slots::handle_connection(&mut peer_slots, peer_id.clone());
+					let worst_peer = peer_slots.peers[peer_slots.peers.len() - 1].clone();
+					for peer_to_evict in peer_slots.sample_connection(peer_id).0.iter()
+					{
+						peer_slots.peer_data.remove(peer_to_evict).unwrap();
+						for (peer_id, peer_data) in peer_slots.peer_data.iter() {
+							assert_eq!(&peer_slots.peers[peer_data.slot_idx], peer_id);
+						}
+
+						// Ensure we are either evicting the sampling peer or the worst performing
+						// peer
+						if &worst_peer != peer_to_evict {
+							count += 1;
+						}
+
+					}
+					offset += 1;
+				}
+
+				// We should never evict anyone other than the sampling or worst performing peer
+				assert_eq!(count, 0);
 			}
 
 			virtual_overseer
@@ -1679,7 +1802,7 @@ mod tests {
 					test_state.collators[0].public(),
 					test_state.chain_ids[0],
 					tx_0,
-				)
+				),
 			).await;
 
 			let (tx_1, rx_1) = oneshot::channel();
@@ -1691,13 +1814,17 @@ mod tests {
 					test_state.collators[1].public(),
 					test_state.chain_ids[0],
 					tx_1,
-				)
+				),
 			).await;
 
 			let response_channel = assert_matches!(
 				overseer_recv(&mut virtual_overseer).await,
-				AllMessages::NetworkBridge(NetworkBridgeMessage::SendRequests(reqs, IfDisconnected::ImmediateError)
-			) => {
+				AllMessages::NetworkBridge(
+					NetworkBridgeMessage::SendRequests(
+						reqs,
+						IfDisconnected::ImmediateError
+					)
+				) => {
 				let req = reqs.into_iter().next()
 					.expect("There should be exactly one request");
 				match req {
@@ -1725,8 +1852,9 @@ mod tests {
 
 			let response_channel = assert_matches!(
 				overseer_recv(&mut virtual_overseer).await,
-				AllMessages::NetworkBridge(NetworkBridgeMessage::SendRequests(reqs, IfDisconnected::ImmediateError)
-			) => {
+				AllMessages::NetworkBridge(
+					NetworkBridgeMessage::SendRequests(reqs, IfDisconnected::ImmediateError),
+				) => {
 				let req = reqs.into_iter().next()
 					.expect("There should be exactly one request");
 				match req {
