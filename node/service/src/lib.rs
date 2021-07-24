@@ -868,7 +868,7 @@ pub fn new_full<RuntimeApi, Executor, OverseerGenerator>(
 	let config = grandpa::Config {
 		// FIXME substrate#1578 make this available through chainspec
 		gossip_duration: Duration::from_millis(1000),
-		justification_period: 512,
+		justification_period: 1,
 		name: Some(name),
 		observer_enabled: false,
 		keystore: keystore_opt,
